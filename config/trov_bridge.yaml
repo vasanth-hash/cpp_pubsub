@@ -1,0 +1,21 @@
+# trov_drive_bridge:
+#   ros__parameters:
+#     max_speed:      1.5    # max expected linear velocity (m/s) — scaling denominator
+#     max_output:     500.0  # MAVLink value at full speed (0–1000). 500 → ~1700 µs PWM
+#     min_output:     0.0    # floor added to every non-zero output. 0 = proportional
+#     deadzone:       0.05   # inputs below this are treated as zero
+#     pivot_output:   550.0  # fixed MAVLink value during pivot. 400 → ~1660 µs PWM
+#     ang_threshold:  0.35   # |angular.z| above this → PIVOT mode (rad/s)
+#     ang_slow_zone:  0.05   # |angular.z| above this → SLOW mode (rad/s)
+#     slow_output:    150.0  # fixed MAVLink throttle in SLOW mode. 150 → ~1560 µs PWM
+#     pivot_z_base:   80.0   # base MAVLink output for angular.z in PIVOT mode. 80 → ~1540 µs PWM
+
+# ttrov_drive_bridge:
+#   ros__parameters:
+#     max_speed:      1.5      # m/s — ceiling of linear.x input range
+#     max_output:     500.0    # max z value sent to Pixhawk
+#     min_output:     0.0      # min z value — raise if ESC beeps on slow start
+#     deadzone:       0.05     # hard zero band — anything below this is ignored
+#     ang_threshold:  0.25     # min |ang| to be treated as a real turn command
+#     pivot_output:   1000.0    # y value sent during pure pivot
+#     settle_secs:    2.0      # stop-hold time when conflict is detected

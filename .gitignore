@@ -1,0 +1,12 @@
+# Temp and duplicate files
+*.save
+
+
+# Not active
+src/rslidar_to_lio.cpp
+src/trov_teleop.cpp
+
+# Python cache
+__pycache__/
+*.pyc
+*.swp
