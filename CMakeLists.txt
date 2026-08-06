@@ -95,19 +95,19 @@ install(TARGETS
  line_follower_bridge
  DESTINATION lib/${PROJECT_NAME})
 
-add_executable(trov_autoware_bridge src/trov_autoware_bridge.cpp)
-ament_target_dependencies(trov_autoware_bridge 
-  rclcpp 
-  geometry_msgs
-  mavros_msgs
-  nav_msgs
-  tf2_ros
-  tf2_geometry_msgs
-  autoware_control_msgs
-  autoware_vehicle_msgs
-  )
-install(TARGETS
- trov_autoware_bridge
- DESTINATION lib/${PROJECT_NAME})
+# add_executable(trov_autoware_bridge src/trov_autoware_bridge.cpp)
+# ament_target_dependencies(trov_autoware_bridge 
+#   rclcpp 
+#   geometry_msgs
+#   mavros_msgs
+#   nav_msgs
+#   tf2_ros
+#   tf2_geometry_msgs
+#   autoware_control_msgs
+#   autoware_vehicle_msgs
+#   )
+# install(TARGETS
+#  trov_autoware_bridge
+#  DESTINATION lib/${PROJECT_NAME})
 
 ament_package()
