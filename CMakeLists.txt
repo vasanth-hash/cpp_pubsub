@@ -68,12 +68,30 @@ ament_target_dependencies(drive_outdoor
   geometry_msgs 
   nav_msgs
   visualization_msgs
+  sensor_msgs
   tf2
   tf2_ros
   )
 
 install(TARGETS
  drive_outdoor
+ DESTINATION lib/${PROJECT_NAME})
+
+# 2026-11-11: pivot-only bridge (no ARC), closed-loop pivot + fused gyro/FAST-LIO yaw rate
+add_executable(drive_outdoor_pivot src/trov_drive_bridge_pivot.cpp)
+ament_target_dependencies(drive_outdoor_pivot
+  rclcpp
+  std_msgs
+  mavros_msgs
+  geometry_msgs
+  nav_msgs
+  sensor_msgs
+  visualization_msgs
+  tf2
+  tf2_ros
+  )
+install(TARGETS
+ drive_outdoor_pivot
  DESTINATION lib/${PROJECT_NAME})
 
 add_executable(trov_teleop src/trov_teleop.cpp)

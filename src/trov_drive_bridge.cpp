@@ -1,931 +1,637 @@
+// cmd_vel_rc_bridge.cpp
+//
+// Nav2 cmd_vel  ->  ArduPilot Rover RC override (native skid-steer mixer).
+//
+// Subscribes to a Twist (default /cmd_vel_smoothed) and publishes
+// mavros_msgs/OverrideRCIn to /mavros/rc/override, driving ONLY the steering
+// channel (RC1) and throttle channel (RC3). Every other channel (incl. arm,
+// RC6) is published as 0 = "use real RC", so the transmitter keeps arm/mode and
+// regains steer+throttle the instant autonomy stops.
+//
+// NOTE: input defaults to /cmd_vel_smoothed (BEFORE collision_monitor). That
+// means this bridge does NOT get collision_monitor's stop gating — chosen
+// deliberately so in-place rotation near walls isn't stalled by the stop
+// polygon. Obstacle safety then rests on the planner + your remote.
+//
+// Motion model (matches the hardware):
+//   * DRIVE (straight): |w| small. Forward throttle is a FIXED PWM (drive_fwd_thr_pwm,
+//             default 1540) whenever v > 0; reverse still scales with v. Small steer,
+//             yaw-rate damper (odom) holds heading and kills weave.
+//   * ARC   : |w| above w_arc_enter. FIXED PWM pairs per direction:
+//               LEFT  (w>0): throttle 1570, steering 1375
+//               RIGHT (w<0): throttle 1530, steering 1550
+//             Steering is SLEW-LIMITED (arc_steer_slew) so entry is smooth, not a lurch.
+//   * STOP  : entered on a FRESH pivot (from driving/idle, or a direction reversal).
+//             Snap neutral, hold brake_time_s — this dwell clears the brake-first
+//             ESC lockout so a true in-place spin is possible. A pivot resumed in
+//             the same direction within pivot_grace_s SKIPS this brake.
+//   * PIVOT : in-place rotation, odom closed-loop on yaw RATE (ramps PWM under
+//             load). LATCHED: brief cmd_vel dropouts (w flicker) within
+//             pivot_grace_s do NOT drop out / re-brake -> continuous rotation.
+//             Nav2 still owns heading (when to stop).   [UNCHANGED]
+//   * HOLD  : Nav2 commands ~0,~0 (and no pivot latched) -> hold neutral, stay put.
+//   * IDLE  : no fresh cmd_vel -> release all channels (remote passes through).
+//
+// Most numeric params are live-tunable: ros2 param set /cmd_vel_rc_bridge <name> <val>
+
 #include <rclcpp/rclcpp.hpp>
 #include <geometry_msgs/msg/twist.hpp>
 #include <mavros_msgs/msg/override_rc_in.hpp>
-#include <mavros_msgs/msg/rc_in.hpp>
 #include <mavros_msgs/msg/state.hpp>
-#include <std_msgs/msg/bool.hpp>
 #include <nav_msgs/msg/odometry.hpp>
-#include <sensor_msgs/msg/laser_scan.hpp>
-#include <visualization_msgs/msg/marker.hpp>
-#include <tf2_ros/transform_listener.h>
-#include <tf2_ros/buffer.h>
-#include <tf2/exceptions.h>
-#include <tf2/LinearMath/Quaternion.h>
-#include <tf2/LinearMath/Matrix3x3.h>
+
 #include <algorithm>
 #include <cmath>
-#include <sstream>
 #include <limits>
+#include <mutex>
 
-enum class DriveState { STRAIGHT, SLOWING, STOPPING, PIVOT, STALLED };
+namespace {
+constexpr uint16_t RC_RELEASE = 0;   // 0 => "use real RC input" on that channel
+constexpr double   EPS         = 1e-6;
 
-struct Point2D { double x; double y; };
+double clampd(double v, double lo, double hi) {
+  return v < lo ? lo : (v > hi ? hi : v);
+}
+double sgn(double v) { return v >= 0.0 ? 1.0 : -1.0; }
+// shortest signed angular difference a-b, wrapped to (-pi, pi]
+double ang_diff(double a, double b) { return std::atan2(std::sin(a - b), std::cos(a - b)); }
+}  // namespace
 
-class TrovBridgeDrive : public rclcpp::Node {
+class CmdVelRcBridge : public rclcpp::Node {
 public:
-  TrovBridgeDrive() : Node("trov_drive_bridge") {
+  CmdVelRcBridge() : Node("cmd_vel_rc_bridge") {
+    // ---- topics / timing ----
+    input_topic_  = declare_parameter<std::string>("input_topic", "/cmd_vel_smoothed");
+    output_topic_ = declare_parameter<std::string>("output_topic", "/mavros/rc/override");
+    rate_hz_      = declare_parameter<double>("publish_rate_hz", 25.0);
+    watchdog_s_   = declare_parameter<double>("watchdog_s", 0.3);
+
+    // ---- channel map (1-indexed RC channels) ----
+    steer_ch_ = declare_parameter<int>("steer_channel", 1);     // RC1
+    thr_ch_   = declare_parameter<int>("throttle_channel", 3);  // RC3
+    arm_ch_   = declare_parameter<int>("arm_channel", 6);       // RC6 - NEVER overridden
+
+    // ---- PWM shaping ----
+    neutral_      = declare_parameter<double>("pwm_neutral", 1501.0);
+    thr_span_     = declare_parameter<double>("thr_span_pwm", 80.0);     // thr_n=1 -> +80
+    steer_span_   = declare_parameter<double>("steer_span_pwm", 80.0);   // steer_n=1 -> +80
+    pivot_pwm_    = declare_parameter<double>("pivot_steer_pwm", 100.0); // pivot feedforward dev
+    comfort_cap_  = declare_parameter<double>("comfort_cap", 1.0);       // cap on OUTER wheel = |thr_n|+|steer_n|
+    pwm_min_      = declare_parameter<double>("pwm_min", 1200.0);
+    pwm_max_      = declare_parameter<double>("pwm_max", 1800.0);
+
+    // ---- cmd_vel -> normalized mapping ----
+    v_scale_ = declare_parameter<double>("v_scale", 0.5);  // m/s  -> throttle_n = 1.0
+    w_scale_ = declare_parameter<double>("w_scale", 1.0);  // rad/s -> steer_n   = 1.0
+
+    // ---- sign conventions (flip on the bench if it drives/turns wrong) ----
+    // steer_sign -1: Nav2 w>0 (CCW/left) -> below-neutral PWM = LEFT on this hw.
+    thr_sign_   = declare_parameter<int>("thr_sign", 1)    >= 0 ? 1.0 : -1.0;
+    steer_sign_ = declare_parameter<int>("steer_sign", -1) >= 0 ? 1.0 : -1.0;
+
+    // ---- DRIVE: fixed forward throttle PWM ----
+    // Used whenever Nav2 commands forward motion (v > 0) in the straight state.
+    drive_fwd_thr_pwm_ = declare_parameter<double>("drive_fwd_thr_pwm", 1540.0);
+
+    // ---- ARC: differential (skid) turn, fixed PWM pairs ----
+    // When |w| exceeds w_arc_enter the arc state is entered. Absolute PWM values:
+    //   LEFT  turn (Nav2 w>0): throttle = arc_left_thr_pwm,  steering = arc_left_steer_pwm
+    //   RIGHT turn (Nav2 w<0): throttle = arc_right_thr_pwm, steering = arc_right_steer_pwm
+    // Steering is SLEW-LIMITED to arc_steer_slew PWM/s so arc entry ramps instead of lurching.
+    // Hysteresis: stays in arc until |w| falls below w_arc_exit.
+    w_arc_enter_      = declare_parameter<double>("w_arc_enter", 0.1);         // rad/s
+    w_arc_exit_       = declare_parameter<double>("w_arc_exit", 0.08);         // rad/s
+    arc_right_thr_pwm_   = declare_parameter<double>("arc_right_thr_pwm", 1530.0);
+    arc_right_steer_pwm_ = declare_parameter<double>("arc_right_steer_pwm", 1550.0);
+    arc_left_thr_pwm_    = declare_parameter<double>("arc_left_thr_pwm", 1570.0);
+    arc_left_steer_pwm_  = declare_parameter<double>("arc_left_steer_pwm", 1375.0);
+    arc_steer_slew_   = declare_parameter<double>("arc_steer_slew", 600.0);    // max steer PWM change per second
+
+    // ---- DRIVE (straight): yaw-rate damper (option B) ----
+    yaw_damp_enable_ = declare_parameter<bool>("yaw_damp_enable", true);
+    yaw_damp_kp_     = declare_parameter<double>("yaw_damp_kp", 0.6);   // rate feedback gain
+    yaw_damp_max_    = declare_parameter<double>("yaw_damp_max", 0.4);  // clamp on FB term (rad/s)
+    yaw_ema_alpha_   = declare_parameter<double>("yaw_ema_alpha", 0.4); // odom yaw-rate smoothing
+
+    // ---- optional odom forward-speed governor ("don't go too fast") ----
+    // 0.0 = OFF. Set e.g. 0.5 once you've confirmed odom-derived speed is clean.
+    // NOTE: forward throttle is now a fixed PWM; if the governor trips, forward
+    // throttle is scaled down from the fixed deviation toward neutral.
+    max_fwd_speed_  = declare_parameter<double>("max_fwd_speed", 0.0);
+    spd_ema_alpha_  = declare_parameter<double>("spd_ema_alpha", 0.3);
+
+    // ---- pivot gate (pure-rotation detection) ----
+    enable_pivot_ = declare_parameter<bool>("enable_pivot", true);
+    v_eps_        = declare_parameter<double>("v_eps", 0.03);          // |v| below = "zero" (HOLD)
+    w_eps_        = declare_parameter<double>("w_eps", 0.05);          // |w| below = "zero"
+    v_pivot_enter_= declare_parameter<double>("v_pivot_enter", 0.08);  // |v| below this & w present -> pivot
+    v_pivot_exit_ = declare_parameter<double>("v_pivot_exit", 0.15);   // |v| above this -> leave pivot (hysteresis)
+    brake_time_s_ = declare_parameter<double>("brake_time_s", 1.0);
+    // Latch: keep rotating through brief cmd_vel gaps, and skip the re-brake when
+    // a same-direction pivot resumes within this window. Must exceed the longest
+    // expected w-dropout but should be < a deliberate "change of mind" pause.
+    pivot_grace_s_= declare_parameter<double>("pivot_grace_s", 0.5);
+
+    // ---- safety gate ----
+    require_armed_ = declare_parameter<bool>("require_armed", true);
+
+    // ---- closed-loop pivot (odom yaw-rate regulation; PIVOT only) ----
+    pivot_cl_      = declare_parameter<bool>("pivot_closed_loop", true);
+    odom_topic_    = declare_parameter<std::string>("odom_topic", "/odom");
+    pivot_window_s_= declare_parameter<double>("pivot_window_s", 0.4);
+    pivot_min_dev_ = declare_parameter<double>("pivot_min_dev", 60.0);
+    pivot_max_dev_ = declare_parameter<double>("pivot_max_dev", 299.0); // ceiling 1501+299 = 1800
+    pivot_step_    = declare_parameter<double>("pivot_step", 20.0);
+    pivot_breakaway_step_ = declare_parameter<double>("pivot_breakaway_step", 40.0);
+    pivot_rate_tol_= declare_parameter<double>("pivot_rate_tol", 0.05);
+    pivot_stuck_rate_ = declare_parameter<double>("pivot_stuck_rate", 0.03);
+    odom_timeout_s_= declare_parameter<double>("odom_timeout_s", 0.3);
+    over_rate_ratio_ = declare_parameter<double>("pivot_over_rate_ratio", 1.5);
+    over_rate_abs_   = declare_parameter<double>("pivot_over_rate_abs", 0.2);
+    max_pivot_rate_= declare_parameter<double>("max_pivot_rate", 0.0);
+
+    v_scale_ = std::max(1e-3, v_scale_);
+    w_scale_ = std::max(1e-3, w_scale_);
+    steer_idx_ = steer_ch_ - 1;
+    thr_idx_   = thr_ch_ - 1;
+    arm_idx_   = arm_ch_ - 1;
+
+    pub_ = create_publisher<mavros_msgs::msg::OverrideRCIn>(output_topic_, 10);
     sub_ = create_subscription<geometry_msgs::msg::Twist>(
-      "/cmd_vel_smoothed", 10,
-      std::bind(&TrovBridgeDrive::cmd_vel_callback, this, std::placeholders::_1));
-
-    odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
-      "/odom", 10,
-      std::bind(&TrovBridgeDrive::odom_callback, this, std::placeholders::_1));
-
+      input_topic_, 10,
+      std::bind(&CmdVelRcBridge::on_cmd, this, std::placeholders::_1));
     state_sub_ = create_subscription<mavros_msgs::msg::State>(
       "/mavros/state", 10,
-      std::bind(&TrovBridgeDrive::state_callback, this, std::placeholders::_1));
+      std::bind(&CmdVelRcBridge::on_state, this, std::placeholders::_1));
+    odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
+      odom_topic_, rclcpp::SensorDataQoS(),
+      std::bind(&CmdVelRcBridge::on_odom, this, std::placeholders::_1));
 
-    rc_in_sub_ = create_subscription<mavros_msgs::msg::RCIn>(
-      "/mavros/rc/in", 10,
-      std::bind(&TrovBridgeDrive::rc_in_callback, this, std::placeholders::_1));
+    const auto period = std::chrono::duration<double>(1.0 / std::max(1.0, rate_hz_));
+    timer_ = create_wall_timer(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(period),
+      std::bind(&CmdVelRcBridge::tick, this));
 
-    // ── Collision self-check setup ──────────────────────────────────────
-    // collision_monitor's own state_topic feature isn't available on this
-    // system's installed nav2_collision_monitor build (state_topic reports
-    // "Parameter not set", no publisher created — confirmed via ros2 param
-    // get / ros2 node info, even after upgrading to the latest available
-    // Humble package). So this replicates the same PolygonStop check
-    // directly against /scan, independent of collision_monitor entirely.
-    tf_buffer_   = std::make_shared<tf2_ros::Buffer>(this->get_clock());
-    tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
-
-    this->declare_parameter<std::vector<double>>(
-      // Forward-only lookout zone: flush against the robot's front edge
-      // (x=1.0, matching footprint exactly — never overlaps the robot
-      // body), same width as the footprint (y -0.7 to 0.7), extending
-      // 0.8m forward (ASSUMPTION — not a computed stopping distance,
-      // just a starting point; tune via this param without recompiling).
-      // Footprint for reference: [[1.0,0.7],[1.0,-0.7],[-0.7,-0.7],[-0.7,0.7]]
-      // "collision_polygon", {1.0, 1.3,  1.0, 0.9,  -0.7, 0.9, -0.7, 1.3});
-      "collision_polygon", {1.13, 0.7, 1.5, 0.7, 1.5, -0.7, 1.13, -0.7});
-
-    this->declare_parameter<int>("collision_min_points", 9);
-    this->declare_parameter<std::string>("collision_base_frame", "base_link");
-    this->declare_parameter<std::string>("scan_topic", "/scan");
-    // Enforcement on/off — detection, logging, and the RViz marker keep
-    // running regardless of this; only the "force neutral" gate in
-    // control_loop() respects it. Default true = same behavior as before
-    // this toggle existed. The topic below overrides this at runtime.
-    this->declare_parameter<bool>("collision_check_enabled", false);
-
-    std::vector<double> polygon_flat =
-      this->get_parameter("collision_polygon").as_double_array();
-    collision_min_points_   = this->get_parameter("collision_min_points").as_int();
-    collision_base_frame_   = this->get_parameter("collision_base_frame").as_string();
-    scan_topic_             = this->get_parameter("scan_topic").as_string();
-    collision_check_enabled_ = this->get_parameter("collision_check_enabled").as_bool();
-
-    if (polygon_flat.size() < 6 || polygon_flat.size() % 2 != 0) {
-      RCLCPP_ERROR(get_logger(),
-        "collision_polygon parameter malformed (need >=3 points as flat "
-        "x,y pairs) — falling back to hardcoded forward-lookout default.");
-      polygon_flat = {1.8, 0.7,  1.8, -0.7,  1.0, -0.7,  1.0, 0.7};
-    }
-    for (size_t i = 0; i + 1 < polygon_flat.size(); i += 2) {
-      collision_polygon_.push_back({polygon_flat[i], polygon_flat[i + 1]});
-    }
-
-    scan_sub_ = create_subscription<sensor_msgs::msg::LaserScan>(
-      scan_topic_, rclcpp::SensorDataQoS(),
-      std::bind(&TrovBridgeDrive::scan_callback, this, std::placeholders::_1));
-
-    // Runtime toggle — publish std_msgs/Bool here to enable/disable
-    // enforcement live, without restarting the node.
-    collision_check_enable_sub_ = create_subscription<std_msgs::msg::Bool>(
-      "/collision_check_enable", 10,
-      std::bind(&TrovBridgeDrive::collision_check_enable_callback, this, std::placeholders::_1));
-
-    // RViz visualization of the collision self-check zone — republished
-    // from our own collision_polygon_ param (not collision_monitor's
-    // /polygon_stop), so it reflects exactly what this node is actually
-    // checking against, and stays live-colored with current stop state.
-    polygon_marker_pub_ = create_publisher<visualization_msgs::msg::Marker>(
-      "/collision_check_polygon", 10);
-
-    pub_ = create_publisher<mavros_msgs::msg::OverrideRCIn>(
-      "/mavros/rc/override", 10);
-
-    // Drive/publish decisions run on this fixed-rate timer, NOT on the
-    // cmd_vel subscription callback — this is what lets us detect
-    // "/cmd_vel_smoothed has gone silent" (nav stack idle) instead of just
-    // never running again if the topic stops.
-    control_timer_ = create_wall_timer(
-      std::chrono::milliseconds(CONTROL_PERIOD_MS_),
-      std::bind(&TrovBridgeDrive::control_loop, this));
-
-    // ── BUILD MARKER — confirm this matches your latest build before
-    //    trusting any other log line below. ─────────────────────────────
-    RCLCPP_WARN(get_logger(),
-      "=== TrovBridgeDrive BUILD: %s %s ===", __DATE__, __TIME__);
+    param_cb_ = add_on_set_parameters_callback(
+      std::bind(&CmdVelRcBridge::on_param_update, this, std::placeholders::_1));
 
     RCLCPP_INFO(get_logger(),
-      "TROV Drive Bridge started — steer=RC%zu(neutral=%.0f right_base=%.0f "
-      "left_base=%.0f step=%.0f min=%.0f max=%.0f) "
-      "throttle=RC%zu(neutral=%.0f base=%.0f step=%.0f max=%.0f no_reverse=true) "
-      "arm=RC%zu(ALWAYS RELEASED) cmd_vel_timeout_ms=%d control_period_ms=%d "
-      "ang_threshold=%.3f ang_slowzone=%.3f "
-      "stop_duration_ms=%d stall_check_ms=%d stall_dist=%.4f stall_zero_ms=%d",
-      STEER_CH_ + 1, NEUTRAL_PWM_, PIVOT_RIGHT_BASE_, PIVOT_LEFT_BASE_,
-      PIVOT_STEP_, PIVOT_MIN_, PIVOT_MAX_,
-      THROTTLE_CH_ + 1, NEUTRAL_PWM_, THROTTLE_BASE_, THROTTLE_STEP_, THROTTLE_MAX_,
-      ARM_CH_ + 1, CMD_VEL_TIMEOUT_MS_, CONTROL_PERIOD_MS_,
-      ANG_THRESHOLD_, ANG_SLOW_ZONE_,
-      STOP_DURATION_MS_, STALL_CHECK_MS_, STALL_DIST_THRESHOLD_,
-      STALL_ZERO_MS_);
-
-    {
-      std::ostringstream poly_oss;
-      for (size_t i = 0; i < collision_polygon_.size(); ++i) {
-        poly_oss << "(" << collision_polygon_[i].x << "," << collision_polygon_[i].y << ")";
-        if (i + 1 < collision_polygon_.size()) poly_oss << " ";
-      }
-      RCLCPP_WARN(get_logger(),
-        "Collision self-check ACTIVE (collision_monitor's state_topic is NOT "
-        "available on this system) — scan_topic=%s base_frame=%s "
-        "min_points=%d polygon=[%s] enforcement_enabled=%s "
-        "(toggle live via /collision_check_enable, std_msgs/Bool)",
-        scan_topic_.c_str(), collision_base_frame_.c_str(),
-        collision_min_points_, poly_oss.str().c_str(),
-        collision_check_enabled_ ? "true" : "false");
-    }
+      "cmd_vel_rc_bridge up: %s -> %s (steer RC%d, thr RC%d, arm RC%d released) @ %.0f Hz",
+      input_topic_.c_str(), output_topic_.c_str(), steer_ch_, thr_ch_, arm_ch_, rate_hz_);
+    RCLCPP_WARN(get_logger(),
+      "Input is %s (pre-collision_monitor) — no collision gating in the bridge. "
+      "Vehicle must be ARMED + MANUAL; SYSID_MYGCS must match MAVROS system_id (1).",
+      input_topic_.c_str());
   }
 
 private:
-  // ── RC channel map (0-indexed; RC1=0, RC3=2, RC6=5) ────────────────────
-  static constexpr size_t STEER_CH_    = 0;  // RC1 - rotation
-  static constexpr size_t THROTTLE_CH_ = 2;  // RC3 - forward drive
-  static constexpr size_t ARM_CH_      = 5;  // RC6 - arm/disarm (NEVER overridden)
-  static constexpr uint16_t RC_RELEASE_ = 0; // 0 = "don't touch, use real RC input"
+  enum class State { IDLE, DRIVE, ARC, STOP, PIVOT, HOLD };
 
-  // ── Shared neutral ───────────────────────────────────────────────────
-  static constexpr double NEUTRAL_PWM_ = 1501.0;
-
-  // ── Throttle (RC3) — forward only, never reverse ────────────────────
-  static constexpr double THROTTLE_BASE_ = 1530.0; // starting output once moving
-  static constexpr double THROTTLE_STEP_ = 10.0;   // adaptive ramp step
-  static constexpr double THROTTLE_MAX_  = 1600.0; // HARD CEILING — never exceed
-  static constexpr double THROTTLE_MIN_  = NEUTRAL_PWM_; // HARD FLOOR — no reverse, ever
-  static constexpr double SLOW_THROTTLE_ = 1515.0;  // ASSUMPTION: fixed creep in SLOWING, tune me
-  static constexpr int    STRAIGHT_CHECK_MS_      = 1500; // ASSUMPTION: tune me
-  static constexpr double STRAIGHT_DIST_THRESHOLD_ = 0.05; // meters, ASSUMPTION: tune me
-
-  // ── Steer / rotation (RC1) ───────────────────────────────────────────
-  // ASSUMPTION: ang > 0 (ROS REP-103, angular.z counter-clockwise) = LEFT.
-  // Verify this matches your hardware's actual turn direction on the bench.
-  static constexpr double PIVOT_RIGHT_BASE_ = 1650.0; // starting output turning right
-  static constexpr double PIVOT_LEFT_BASE_  = 1340.0; // starting output turning left
-  static constexpr double PIVOT_STEP_       = 10.0;   // adaptive ramp step
-  static constexpr double PIVOT_MIN_        = 1100.0; // HARD FLOOR — never exceed (left ramp limit)
-  static constexpr double PIVOT_MAX_        = 1800.0; // HARD CEILING — never exceed (right ramp limit)
-  static constexpr int    PIVOT_CHECK_MS_      = 1500;
-  static constexpr double PIVOT_ROT_THRESHOLD_ = 0.5;  // radians
-  // ang must stay continuously ABOVE threshold this long before PIVOT is
-  // entered, and continuously BELOW threshold this long before PIVOT is
-  // exited — same debounce window used symmetrically both ways.
-  // ASSUMPTION, tune me.
-  static constexpr int    PIVOT_HOLD_MS_ = 90;
-
-  // ── cmd_vel watchdog — if no /cmd_vel_smoothed message arrives within
-  //    this window, the nav stack is considered idle/dead and all channels
-  //    are released to the RC receiver. ASSUMPTION: tune this. It must be
-  //    comfortably larger than your nav stack's normal publish period
-  //    (looked like ~50ms/20Hz in your log) but small enough to feel
-  //    responsive when you actually want the sticks back.
-  static constexpr int    CMD_VEL_TIMEOUT_MS_ = 300;
-  static constexpr int    CONTROL_PERIOD_MS_  = 50; // 20Hz control/publish loop
-
-  // ── Drive constants ────────────────────────────────────────────────────
-  static constexpr double DEADZONE_         = 0.09; // cmd_vel deadzone (m/s, rad/s)
-  static constexpr double ANG_THRESHOLD_    = 0.15;
-  static constexpr double ANG_SLOW_ZONE_    = 0.1;
-  static constexpr int    STOP_DURATION_MS_ = 2000;
-
-  // ── Stall-detection constants (full stop, distinct from throttle ramp) ─
-  static constexpr int    STALL_CHECK_MS_       = 7000;
-  static constexpr double STALL_DIST_THRESHOLD_ = 0.02;
-  static constexpr int    STALL_ZERO_MS_        = 1000;
-
-  // ── Collision self-check minimum hold duration — once a stop is
-  //    triggered (scan data confirmed inside the polygon), enforcement
-  //    must continue for at least this long even if the scan briefly
-  //    reports clear on an intermediate cycle (avoids single-scan flicker
-  //    letting the robot resume immediately, e.g. right after Nav2 has
-  //    replanned around the same still-present obstacle). ASSUMPTION —
-  //    tune me.
-  static constexpr int    COLLISION_STOP_HOLD_MS_ = 3000;
-
-  // ── Runtime state ──────────────────────────────────────────────────────
-  DriveState   state_    = DriveState::STRAIGHT;
-  rclcpp::Time stop_start_;
-  double       last_ang_ = 0.0;
-
-  bool is_armed_  = false;
-  bool was_armed_ = false;
-
-  rclcpp::Time stall_window_start_;
-  double       stall_window_x_    = 0.0;
-  double       stall_window_y_    = 0.0;
-  bool         stall_window_set_  = false;
-  rclcpp::Time stall_zero_start_;
-  bool         output_is_nonzero_ = false;
-
-  // Adaptive pivot (rotation) tracking
-  double       current_pivot_output_ = NEUTRAL_PWM_;
-  rclcpp::Time pivot_check_start_;
-  double       pivot_start_yaw_      = 0.0;
-  bool         pivot_check_set_      = false;
-  bool         pivot_exit_pending_   = false;
-  rclcpp::Time pivot_exit_start_;
-  bool         pivot_entry_pending_   = false;
-  rclcpp::Time pivot_entry_start_;
-  bool         pivot_entry_was_left_  = false;
-
-  // Adaptive straight (throttle) tracking
-  double       current_straight_output_ = THROTTLE_BASE_;
-  rclcpp::Time straight_check_start_;
-  double       straight_start_x_ = 0.0;
-  double       straight_start_y_ = 0.0;
-  bool         straight_check_set_ = false;
-
-  // Latest odom
-  double odom_x_   = 0.0;
-  double odom_y_   = 0.0;
-  double odom_yaw_ = 0.0;
-  bool   odom_ok_  = false;
-
-  // Latest cmd_vel (consumed by the timer-driven control loop, not the
-  // subscription callback itself — see control_loop())
-  bool                                      have_cmd_vel_ = false;
-  rclcpp::Time                              last_cmd_vel_time_;
-  geometry_msgs::msg::Twist::SharedPtr      last_cmd_vel_msg_;
-
-  // RC input bookkeeping (logging / arm-channel truth only — no longer used
-  // for manual-override detection, see conversation history for why)
-  bool         rc_in_ok_            = false;
-  size_t       rc_in_channel_count_ = 0;
-  uint16_t     last_rc_in_arm_raw_  = 0;
-
-  // Collision self-check state (scan-based, see scan_callback()).
-  // Defaults to "clear" — flips true only on a confirmed detection.
-  bool   collision_stop_active_  = false;
-  int    last_points_inside_     = 0;
-  bool   scan_ok_                = false;
-  bool   collision_check_enabled_ = false; // enforcement on/off — see constructor
-
-  // Collision self-check minimum-hold bookkeeping. Set on the rising edge
-  // of collision_stop_active_ (false -> true) inside set_collision_stop().
-  // While "now" is before collision_stop_hold_until_, enforcement in
-  // control_loop() stays latched to STOP even if collision_stop_active_
-  // has since flickered back to false on a later scan.
-  rclcpp::Time collision_stop_hold_until_;
-  bool         collision_stop_hold_set_ = false;
-
-  // Collision self-check configuration (ROS params, see constructor)
-  std::vector<Point2D> collision_polygon_;
-  int                   collision_min_points_ = 9;
-  std::string           collision_base_frame_ = "base_link";
-  std::string           scan_topic_           = "/scan";
-  std::shared_ptr<tf2_ros::Buffer>            tf_buffer_;
-  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
-  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr collision_check_enable_sub_;
-
-  // ── Arm state callback ─────────────────────────────────────────────────
-  void state_callback(const mavros_msgs::msg::State::SharedPtr msg) {
-    is_armed_ = msg->armed;
-
-    if (was_armed_ && !is_armed_) {
-      RCLCPP_WARN(get_logger(),
-        "DISARM detected — resetting pivot/straight ramps and stall window.");
-      reset_pivot_state();
-      reset_straight_state();
-      reset_stall_window();
-      state_ = DriveState::STRAIGHT;
-    }
-
-    was_armed_ = is_armed_;
+  // ---------- callbacks ----------
+  void on_cmd(const geometry_msgs::msg::Twist::SharedPtr msg) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    last_v_ = msg->linear.x;
+    last_w_ = msg->angular.z;
+    last_cmd_t_ = now();
+    have_cmd_ = true;
   }
 
-  // ── cmd_vel subscription — just stores the latest message. All actual
-  //    driving/publishing decisions happen in control_loop() below, driven
-  //    by the timer, so we can detect the topic going silent. ─────────────
-  void cmd_vel_callback(const geometry_msgs::msg::Twist::SharedPtr msg) {
-    last_cmd_vel_msg_  = msg;
-    last_cmd_vel_time_ = now();
-    have_cmd_vel_      = true;
-  }
-
-  // ── Odom callback ──────────────────────────────────────────────────────
-  void odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg) {
-    odom_x_ = msg->pose.pose.position.x;
-    odom_y_ = msg->pose.pose.position.y;
-
+  void on_odom(const nav_msgs::msg::Odometry::SharedPtr msg) {
     const auto & q = msg->pose.pose.orientation;
-    tf2::Quaternion tf_q(q.x, q.y, q.z, q.w);
-    tf2::Matrix3x3 m(tf_q);
-    double roll, pitch, yaw;
-    m.getRPY(roll, pitch, yaw);
-    odom_yaw_ = yaw;
+    const double yaw = std::atan2(2.0 * (q.w * q.z + q.x * q.y),
+                                  1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+    const double px = msg->pose.pose.position.x;
+    const double py = msg->pose.pose.position.y;
 
-    odom_ok_ = true;
-  }
-
-  // ── Collision check enable/disable toggle — runtime override via topic.
-  //    Detection (scan_callback) and the RViz marker keep running either
-  //    way; this only gates enforcement in control_loop(). ────────────────
-  void collision_check_enable_callback(const std_msgs::msg::Bool::SharedPtr msg) {
-    if (msg->data != collision_check_enabled_) {
-      RCLCPP_WARN(get_logger(),
-        "COLLISION CHECK enforcement toggled -> %s (via /collision_check_enable)",
-        msg->data ? "ENABLED" : "DISABLED");
-    }
-    collision_check_enabled_ = msg->data;
-  }
-
-  // ── Collision self-check — helper to apply a state change with the same
-  //    ramp/stall-window reset behavior the old collision_monitor-based
-  //    version used, so behavior on transition is unchanged. Also arms the
-  //    minimum-hold timer on the rising edge (false -> true), see
-  //    collision_stop_hold_until_ above. ────────────────────────────────
-  void set_collision_stop(bool stop, int points_inside, const char * reason) {
-    if (stop != collision_stop_active_) {
-      RCLCPP_WARN(get_logger(),
-        "COLLISION CHECK: state changed -> %s (reason=%s, points_inside=%d, "
-        "min_points=%d)",
-        stop ? "STOP" : "CLEAR", reason, points_inside, collision_min_points_);
-      reset_straight_state();
-      reset_pivot_state();
-      reset_stall_window();
-
-      if (stop) {
-        collision_stop_hold_until_ = now() + rclcpp::Duration(
-          std::chrono::milliseconds(COLLISION_STOP_HOLD_MS_));
-        collision_stop_hold_set_ = true;
-        RCLCPP_WARN(get_logger(),
-          "COLLISION CHECK: latching STOP for a minimum of %dms regardless "
-          "of subsequent scan clears.", COLLISION_STOP_HOLD_MS_);
+    std::lock_guard<std::mutex> lk(mtx_);
+    const rclcpp::Time t = now();
+    if (have_prev_odom_) {
+      const double dt = (t - last_odom_t_).seconds();
+      if (dt > 1e-3) {
+        const double r = ang_diff(yaw, prev_yaw_) / dt;         // yaw rate, REP-103 (CCW+)
+        yaw_rate_meas_ = yaw_ema_alpha_ * r + (1.0 - yaw_ema_alpha_) * yaw_rate_meas_;
+        const double dx = px - prev_px_, dy = py - prev_py_;
+        const double sp = std::sqrt(dx * dx + dy * dy) / dt;    // speed magnitude (>=0)
+        fwd_speed_meas_ = spd_ema_alpha_ * sp + (1.0 - spd_ema_alpha_) * fwd_speed_meas_;
       }
     }
-    collision_stop_active_ = stop;
-    last_points_inside_    = points_inside;
+    prev_yaw_ = yaw; prev_px_ = px; prev_py_ = py;
+    last_yaw_ = yaw; last_odom_t_ = t;
+    have_odom_ = true; have_prev_odom_ = true;
   }
 
-  // ── Whether enforcement should currently hold the robot stopped — true
-  //    scan detection OR still inside the minimum post-trigger hold
-  //    window armed in set_collision_stop() above. ────────────────────────
-  bool collision_stop_enforced() const {
-    if (collision_stop_active_) return true;
-    if (collision_stop_hold_set_ && now() < collision_stop_hold_until_) return true;
-    return false;
-  }
-
-  // Ray-casting point-in-polygon test (even-odd rule). Works for any
-  // simple polygon, not just the current rectangular PolygonStop shape —
-  // so if collision_polygon param is changed to something non-rectangular
-  // later, this still holds.
-  bool point_in_polygon(double x, double y) const {
-    bool inside = false;
-    const size_t n = collision_polygon_.size();
-    for (size_t i = 0, j = n - 1; i < n; j = i++) {
-      const double xi = collision_polygon_[i].x, yi = collision_polygon_[i].y;
-      const double xj = collision_polygon_[j].x, yj = collision_polygon_[j].y;
-      const bool intersect = ((yi > y) != (yj > y)) &&
-        (x < (xj - xi) * (y - yi) / (yj - yi) + xi);
-      if (intersect) inside = !inside;
+  void on_state(const mavros_msgs::msg::State::SharedPtr msg) {
+    if (was_armed_ && !msg->armed) {
+      RCLCPP_WARN(get_logger(), "DISARM detected — resetting bridge to IDLE.");
+      std::lock_guard<std::mutex> lk(mtx_);
+      state_ = State::IDLE;
     }
-    return inside;
+    was_armed_ = msg->armed;
+    is_armed_  = msg->armed;
   }
 
-  // ── RViz visualization — outline of collision_polygon_, colored by
-  //    current stop state. Published every scan cycle so it stays live. ──
-  void publish_polygon_marker([[maybe_unused]] bool stop_active, const rclcpp::Time & stamp) {
-    visualization_msgs::msg::Marker marker;
-    marker.header.frame_id = collision_base_frame_;
-    marker.header.stamp    = stamp;
-    marker.ns     = "collision_self_check";
-    marker.id     = 0;
-    marker.type   = visualization_msgs::msg::Marker::LINE_STRIP;
-    marker.action = visualization_msgs::msg::Marker::ADD;
-    marker.scale.x = 0.05; // line width, meters
-    marker.lifetime = rclcpp::Duration::from_seconds(0.5); // auto-expire if node stops publishing
-
-    // Static red always — explicit instruction, replacing the earlier
-    // state-dependent green/red/gray coloring I'd added unprompted.
-    marker.color.r = 0.0f; marker.color.g = 0.0f; marker.color.b = 1.0f; marker.color.a = 1.0f;
-
-    marker.points.reserve(collision_polygon_.size() + 1);
-    for (const auto & pt : collision_polygon_) {
-      geometry_msgs::msg::Point p;
-      p.x = pt.x; p.y = pt.y; p.z = 0.0;
-      marker.points.push_back(p);
+  rcl_interfaces::msg::SetParametersResult
+  on_param_update(const std::vector<rclcpp::Parameter> & params) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    for (const auto & p : params) {
+      const auto & n = p.get_name();
+      if      (n == "thr_span_pwm")    thr_span_    = p.as_double();
+      else if (n == "steer_span_pwm")  steer_span_  = p.as_double();
+      else if (n == "pivot_steer_pwm") pivot_pwm_   = p.as_double();
+      else if (n == "comfort_cap")     comfort_cap_ = p.as_double();
+      else if (n == "pwm_neutral")     neutral_     = p.as_double();
+      else if (n == "v_scale")         v_scale_     = std::max(1e-3, p.as_double());
+      else if (n == "w_scale")         w_scale_     = std::max(1e-3, p.as_double());
+      else if (n == "thr_sign")        thr_sign_    = p.as_int() >= 0 ? 1.0 : -1.0;
+      else if (n == "steer_sign")      steer_sign_  = p.as_int() >= 0 ? 1.0 : -1.0;
+      else if (n == "drive_fwd_thr_pwm")    drive_fwd_thr_pwm_    = p.as_double();
+      else if (n == "w_arc_enter")     w_arc_enter_  = p.as_double();
+      else if (n == "w_arc_exit")      w_arc_exit_   = p.as_double();
+      else if (n == "arc_right_thr_pwm")    arc_right_thr_pwm_    = p.as_double();
+      else if (n == "arc_right_steer_pwm")  arc_right_steer_pwm_  = p.as_double();
+      else if (n == "arc_left_thr_pwm")     arc_left_thr_pwm_     = p.as_double();
+      else if (n == "arc_left_steer_pwm")   arc_left_steer_pwm_   = p.as_double();
+      else if (n == "arc_steer_slew")  arc_steer_slew_ = p.as_double();
+      else if (n == "yaw_damp_enable") yaw_damp_enable_ = p.as_bool();
+      else if (n == "yaw_damp_kp")     yaw_damp_kp_  = p.as_double();
+      else if (n == "yaw_damp_max")    yaw_damp_max_ = p.as_double();
+      else if (n == "yaw_ema_alpha")   yaw_ema_alpha_= clampd(p.as_double(), 0.01, 1.0);
+      else if (n == "max_fwd_speed")   max_fwd_speed_= p.as_double();
+      else if (n == "spd_ema_alpha")   spd_ema_alpha_= clampd(p.as_double(), 0.01, 1.0);
+      else if (n == "enable_pivot")    enable_pivot_ = p.as_bool();
+      else if (n == "v_eps")           v_eps_        = p.as_double();
+      else if (n == "w_eps")           w_eps_        = p.as_double();
+      else if (n == "v_pivot_enter")   v_pivot_enter_= p.as_double();
+      else if (n == "v_pivot_exit")    v_pivot_exit_ = p.as_double();
+      else if (n == "brake_time_s")    brake_time_s_ = p.as_double();
+      else if (n == "pivot_grace_s")   pivot_grace_s_= p.as_double();
+      else if (n == "watchdog_s")      watchdog_s_   = p.as_double();
+      else if (n == "pivot_closed_loop")     pivot_cl_             = p.as_bool();
+      else if (n == "pivot_window_s")        pivot_window_s_       = p.as_double();
+      else if (n == "pivot_min_dev")         pivot_min_dev_        = p.as_double();
+      else if (n == "pivot_max_dev")         pivot_max_dev_        = p.as_double();
+      else if (n == "pivot_step")            pivot_step_           = p.as_double();
+      else if (n == "pivot_breakaway_step")  pivot_breakaway_step_ = p.as_double();
+      else if (n == "pivot_rate_tol")        pivot_rate_tol_       = p.as_double();
+      else if (n == "pivot_stuck_rate")      pivot_stuck_rate_     = p.as_double();
+      else if (n == "odom_timeout_s")        odom_timeout_s_       = p.as_double();
+      else if (n == "pivot_over_rate_ratio") over_rate_ratio_      = p.as_double();
+      else if (n == "pivot_over_rate_abs")   over_rate_abs_        = p.as_double();
+      else if (n == "max_pivot_rate")        max_pivot_rate_       = p.as_double();
     }
-    if (!collision_polygon_.empty()) {
-      geometry_msgs::msg::Point p; // close the loop back to the first vertex
-      p.x = collision_polygon_.front().x;
-      p.y = collision_polygon_.front().y;
-      p.z = 0.0;
-      marker.points.push_back(p);
-    }
-
-    polygon_marker_pub_->publish(marker);
+    rcl_interfaces::msg::SetParametersResult res;
+    res.successful = true;
+    return res;
   }
 
-
-  // ── Scan callback — the collision self-check itself. Runs at whatever
-  //    rate /scan actually publishes (confirmed solid 10Hz on this system,
-  //    independent of collision_monitor's broken output rate). ───────────
-  void scan_callback(const sensor_msgs::msg::LaserScan::SharedPtr msg) {
-    scan_ok_ = true;
-
-    double tx = 0.0, ty = 0.0, cy = 1.0, sy = 0.0; // identity by default
-
-    // Confirmed via `ros2 topic echo /scan` that this system's
-    // pointcloud_to_laserscan_node already stamps /scan with frame_id
-    // "base_link" directly (target_frame set upstream) — so in the common
-    // case no TF lookup is needed at all, and we skip it explicitly rather
-    // than relying on tf2's implicit self-transform special-case.
-    if (msg->header.frame_id != collision_base_frame_) {
-      geometry_msgs::msg::TransformStamped tf_stamped;
-      try {
-        tf_stamped = tf_buffer_->lookupTransform(
-          collision_base_frame_, msg->header.frame_id, msg->header.stamp,
-          rclcpp::Duration::from_seconds(0.1));
-      } catch (const tf2::TransformException & ex) {
-        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-          "COLLISION CHECK: TF lookup %s -> %s failed (%s) — cannot verify "
-          "clearance, failing safe to STOP.",
-          msg->header.frame_id.c_str(), collision_base_frame_.c_str(), ex.what());
-        set_collision_stop(true, -1, "tf_lookup_failed");
-        publish_polygon_marker(true, msg->header.stamp);
-        return;
-      }
-
-      tx = tf_stamped.transform.translation.x;
-      ty = tf_stamped.transform.translation.y;
-      tf2::Quaternion q(
-        tf_stamped.transform.rotation.x, tf_stamped.transform.rotation.y,
-        tf_stamped.transform.rotation.z, tf_stamped.transform.rotation.w);
-      double roll, pitch, yaw;
-      tf2::Matrix3x3(q).getRPY(roll, pitch, yaw);
-      cy = std::cos(yaw);
-      sy = std::sin(yaw);
-    }
-
-    int points_inside = 0;
-    for (size_t i = 0; i < msg->ranges.size(); ++i) {
-      const float range = msg->ranges[i];
-      if (!std::isfinite(range)) continue;
-      if (range < msg->range_min || range > msg->range_max) continue;
-
-      const double angle = msg->angle_min + static_cast<double>(i) * msg->angle_increment;
-      const double lx = range * std::cos(angle);
-      const double ly = range * std::sin(angle);
-
-      // 2D rigid transform: laser frame -> collision_base_frame_
-      const double bx = tx + cy * lx - sy * ly;
-      const double by = ty + sy * lx + cy * ly;
-
-      if (point_in_polygon(bx, by)) {
-        ++points_inside;
-        if (points_inside >= collision_min_points_) break; // no need to keep counting
-      }
-    }
-
-    const bool now_stop = (points_inside >= collision_min_points_);
-    set_collision_stop(now_stop, points_inside, "scan_check");
-    publish_polygon_marker(now_stop, msg->header.stamp);
-  }
-
-  // ── RC input callback — deadman detection ───────────────────────────────
-  void rc_in_callback(const mavros_msgs::msg::RCIn::SharedPtr msg) {
-    if (rc_in_channel_count_ != msg->channels.size()) {
-      rc_in_channel_count_ = msg->channels.size();
-      RCLCPP_WARN(get_logger(),
-        "/mavros/rc/in reports %zu channels", rc_in_channel_count_);
-    }
-
-    if (msg->channels.size() <= std::max(STEER_CH_, THROTTLE_CH_)) {
-      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 2000,
-        "/mavros/rc/in has fewer channels (%zu) than needed — cannot read sticks!",
-        msg->channels.size());
-      return;
-    }
-    rc_in_ok_ = true;
-
-    if (msg->channels.size() > ARM_CH_) {
-      last_rc_in_arm_raw_ = msg->channels[ARM_CH_];
-    }
-
-    //RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
-    // "[DEBUG rc/in] steer(ch%zu)=%d throttle(ch%zu)=%d arm(ch%zu)=%d "
-    //"(not used for control decisions — see cmd_vel watchdog instead)",
-    //  STEER_CH_ + 1, msg->channels[STEER_CH_],
-    //  THROTTLE_CH_ + 1, msg->channels[THROTTLE_CH_],
-    //  ARM_CH_ + 1, last_rc_in_arm_raw_);
-  }
-
-  // ── Helpers ────────────────────────────────────────────────────────────
-  void reset_pivot_state() {
-    current_pivot_output_ = NEUTRAL_PWM_;
-    pivot_check_set_      = false;
-    pivot_exit_pending_    = false;
-    pivot_entry_pending_   = false;
-  }
-
-  void reset_straight_state() {
-    current_straight_output_ = THROTTLE_BASE_;
-    straight_check_set_      = false;
-  }
-
-  void reset_stall_window() {
-    stall_window_set_ = false;
-  }
-
-  mavros_msgs::msg::OverrideRCIn make_release_all() const {
+  // ---------- publish helpers (single path; arm channel always released) ----------
+  mavros_msgs::msg::OverrideRCIn blank() const {
     mavros_msgs::msg::OverrideRCIn mc;
-    mc.channels.fill(RC_RELEASE_);
+    mc.channels.fill(RC_RELEASE);
     return mc;
   }
-
-  // ── SINGLE publish path — arm channel guaranteed released here ────────
-  void publish_override(mavros_msgs::msg::OverrideRCIn mc, const char * reason) {
-    mc.channels[ARM_CH_] = RC_RELEASE_;
-
-    std::ostringstream oss;
-    for (size_t i = 0; i < mc.channels.size(); ++i) {
-      oss << mc.channels[i];
-      if (i + 1 < mc.channels.size()) oss << ",";
-    }
-    //RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 500,
-    //  "[DEBUG override PUBLISH reason=%s] arm_ch(RC%zu)=%d rc_in_arm_raw=%d "
-    //  "channels=[%s]",
-    //  reason, ARM_CH_ + 1, mc.channels[ARM_CH_], last_rc_in_arm_raw_,
-    //  oss.str().c_str());
-
+  void publish(mavros_msgs::msg::OverrideRCIn mc) {
+    if (arm_idx_ >= 0 && static_cast<size_t>(arm_idx_) < mc.channels.size())
+      mc.channels[arm_idx_] = RC_RELEASE;
     pub_->publish(mc);
   }
+  void publish_release() { publish(blank()); }
+  void publish_pair(double steer_pwm, double thr_pwm) {
+    auto mc = blank();
+    mc.channels[steer_idx_] =
+      static_cast<uint16_t>(std::lround(clampd(steer_pwm, pwm_min_, pwm_max_)));
+    mc.channels[thr_idx_] =
+      static_cast<uint16_t>(std::lround(clampd(thr_pwm, pwm_min_, pwm_max_)));
+    publish(mc);
+  }
+  void publish_neutral() { publish_pair(neutral_, neutral_); }
 
-  // ── Control loop — runs on a fixed timer, NOT on cmd_vel arrival ────────
-  void control_loop() {
-    if (!rc_in_ok_) {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-        "No /mavros/rc/in received yet — refusing to drive, releasing all channels.");
-      publish_override(make_release_all(), "no_rc_in_yet");
-      output_is_nonzero_ = false;
+  // record that we just left STOP/PIVOT, for the skip-rebrake window
+  void mark_pivot_exit(const rclcpp::Time & t) {
+    last_pivot_exit_t_   = t;
+    last_exit_pivot_dir_ = pivot_dir_;
+    have_pivot_exit_     = true;
+    pivot_win_set_       = false;
+  }
+
+  // ---------- main loop ----------
+  void tick() {
+    std::lock_guard<std::mutex> lk(mtx_);
+    const rclcpp::Time t = now();
+
+    // arm gate
+    if (require_armed_ && !is_armed_) {
+      if (state_ != State::IDLE)
+        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
+          "DISARMED — releasing all channels to RC.");
+      state_ = State::IDLE;
+      publish_release();
       return;
     }
 
-    // scan_ok_ is only required when enforcement is actually on — if
-    // collision checking is disabled, missing /scan shouldn't block driving
-    // either, since nothing downstream depends on it in that case.
-    if (collision_check_enabled_ && !scan_ok_) {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-        "No /scan received yet — cannot verify collision clearance, "
-        "refusing to drive, releasing all channels.");
-      publish_override(make_release_all(), "no_scan_yet");
-      output_is_nonzero_ = false;
+    // watchdog: nav silent -> hand everything back to the remote.
+    // (keys on message ARRIVAL, not content; pivot latch below handles w flicker)
+    const double since = have_cmd_ ? (t - last_cmd_t_).seconds()
+                                   : std::numeric_limits<double>::infinity();
+    if (since > watchdog_s_) {
+      if (state_ != State::IDLE)
+        RCLCPP_INFO(get_logger(), "no cmd_vel -> releasing to remote (IDLE)");
+      state_ = State::IDLE;
+      publish_release();
       return;
     }
 
-    if (!is_armed_) {
-      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
-        "Vehicle DISARMED — releasing all channels to RC.");
-      publish_override(make_release_all(), "disarmed");
-      output_is_nonzero_ = false;
+    const double v = last_v_, w = last_w_;
+    const bool in_pivot_states = (state_ == State::STOP || state_ == State::PIVOT);
+
+    // --- pure-rotation detection (this tick) + latch bookkeeping ---
+    const double v_thresh = in_pivot_states ? v_pivot_exit_ : v_pivot_enter_;
+    const bool pivot_cmd_now = enable_pivot_
+                               && std::fabs(v) < v_thresh
+                               && std::fabs(w) > w_eps_;
+    if (pivot_cmd_now) {
+      last_pivot_cmd_t_  = t;
+      last_pivot_dir_    = sgn(steer_sign_ * w);
+      last_pivot_target_ = std::fabs(steer_sign_ * w);
+      have_pivot_cmd_    = true;
+    }
+    // Latch keeps us rotating through brief command gaps (only meaningful once
+    // we're actually in a pivot state).
+    const bool pivot_latched = in_pivot_states && have_pivot_cmd_
+                               && (t - last_pivot_cmd_t_).seconds() < pivot_grace_s_;
+
+    // Nav2 commands a stop -> hold position (but NOT while a pivot is latched
+    // through a momentary w-dropout).
+    if (!pivot_latched && std::fabs(v) < v_eps_ && std::fabs(w) < w_eps_) {
+      if (in_pivot_states) mark_pivot_exit(t);
+      state_ = State::HOLD;
+      publish_neutral();
+      log_throttled(v, w);
       return;
     }
 
-    // ── cmd_vel watchdog: if the nav stack hasn't published in a while,
-    //    treat it as idle and hand full control back to the RC receiver. ──
-    const auto since_cmd_vel_ms = have_cmd_vel_
-      ? (now() - last_cmd_vel_time_).nanoseconds() / 1'000'000
-      : std::numeric_limits<long>::max();
+    // ================= PIVOT (pure rotation), latched =================
+    if (pivot_cmd_now || pivot_latched) {
+      if (!in_pivot_states) {
+        // fresh entry from driving/idle: brake first UNLESS we were just
+        // pivoting the same direction (ESC reverse lockout still clear).
+        pivot_dir_     = sgn(steer_sign_ * w);
+        pivot_win_set_ = false;
+        const bool recent_same_dir =
+          have_pivot_exit_
+          && (t - last_pivot_exit_t_).seconds() < pivot_grace_s_
+          && sgn(pivot_dir_) == sgn(last_exit_pivot_dir_);
+        if (recent_same_dir) {
+          state_ = State::PIVOT;        // resume immediately, no re-brake
+          RCLCPP_INFO(get_logger(), "PIVOT resume (same dir, <%.2fs) — skipping brake",
+            pivot_grace_s_);
+        } else {
+          state_ = State::STOP;
+          stop_start_ = t;
+        }
+      } else if (pivot_cmd_now && sgn(steer_sign_ * w) != sgn(pivot_dir_)) {
+        // genuine direction reversal: must re-brake to clear lockout the other way
+        pivot_dir_     = sgn(steer_sign_ * w);
+        pivot_win_set_ = false;
+        state_ = State::STOP;
+        stop_start_ = t;
+        RCLCPP_INFO(get_logger(), "PIVOT direction reversed — re-braking");
+      }
 
-    if (!have_cmd_vel_ || since_cmd_vel_ms > CMD_VEL_TIMEOUT_MS_) {
-      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
-        "/cmd_vel_smoothed idle/silent (%s) — releasing all channels to RC.",
-        have_cmd_vel_ ? "timeout" : "never received");
-      publish_override(make_release_all(), "cmd_vel_idle");
-      output_is_nonzero_ = false;
-      return;
-    }
-
-    // ── Collision self-check hard stop — takes priority over the drive
-    //    state machine every tick, driven by /scan directly (not
-    //    collision_monitor, whose state_topic is unavailable on this
-    //    system's installed build). We actively command neutral (not a
-    //    full release) since this is an autonomy-active safety stop, not
-    //    a hand-back-to-RC event. Gated on collision_check_enabled_ —
-    //    detection (scan_callback) keeps running either way, only
-    //    enforcement here respects the toggle. Uses collision_stop_enforced()
-    //    rather than the raw collision_stop_active_ flag so that once
-    //    triggered, the stop is held for a minimum of
-    //    COLLISION_STOP_HOLD_MS_ even if a later scan cycle briefly reports
-    //    clear (single-scan flicker), instead of releasing immediately. ──
-    if (collision_check_enabled_ && collision_stop_enforced()) {
-      mavros_msgs::msg::OverrideRCIn mc = make_release_all();
-      mc.channels[THROTTLE_CH_] = static_cast<uint16_t>(NEUTRAL_PWM_);
-      mc.channels[STEER_CH_]    = static_cast<uint16_t>(NEUTRAL_PWM_);
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
-        "COLLISION STOP active (points_inside=%d, min_points=%d) — "
-        "forcing neutral, drive state machine bypassed.",
-        last_points_inside_, collision_min_points_);
-      publish_override(mc, "collision_stop");
-      output_is_nonzero_ = false;
-      return;
-    }
-
-    const auto & msg = last_cmd_vel_msg_;
-    mavros_msgs::msg::OverrideRCIn mc = make_release_all();
-
-    const double lin = apply_deadzone(msg->linear.x);
-    const double ang = apply_deadzone(msg->angular.z);
-
-    if (state_ == DriveState::STALLED) {
-      const auto elapsed_ms = (now() - stall_zero_start_).nanoseconds() / 1'000'000;
-      if (elapsed_ms < STALL_ZERO_MS_) {
-        mc.channels[THROTTLE_CH_] = static_cast<uint16_t>(NEUTRAL_PWM_);
-        mc.channels[STEER_CH_]    = static_cast<uint16_t>(NEUTRAL_PWM_);
-        publish_override(mc, "stalled");
-        output_is_nonzero_ = false;
+      if (state_ == State::STOP) {
+        publish_neutral();                 // full stop clears ESC lockout
+        if ((t - stop_start_).seconds() >= brake_time_s_)
+          state_ = State::PIVOT;
+        log_throttled(v, w);
         return;
       }
-      RCLCPP_INFO(get_logger(), "-> STALLED complete, resuming normal control");
-      state_ = DriveState::STRAIGHT;
-      reset_stall_window();
+
+      // PIVOT: regulate yaw rate to the last commanded target (held through gaps)
+      double target = last_pivot_target_;
+      if (max_pivot_rate_ > EPS) target = std::min(target, max_pivot_rate_);
+      const double dev = pivot_closed_loop_dev(target, t);
+      publish_pair(neutral_ + pivot_dir_ * dev, neutral_);
+      log_throttled(v, w);
+      return;
     }
 
-    // ── Normal state transitions ────────────────────────────────────────
-    const DriveState prev_state = state_;
+    // not pivoting this tick: if we were, record the exit for the skip window
+    if (in_pivot_states) mark_pivot_exit(t);
 
-    if (state_ == DriveState::PIVOT) {
-      // Exiting PIVOT: ang must stay continuously BELOW threshold for
-      // PIVOT_HOLD_MS_ before we actually leave. Any single tick back above
-      // threshold cancels the pending exit and resets the timer.
-      if (std::fabs(ang) > ANG_THRESHOLD_) {
-        pivot_exit_pending_ = false;
-      } else {
-        if (!pivot_exit_pending_) {
-          pivot_exit_pending_ = true;
-          pivot_exit_start_   = now();
-          RCLCPP_INFO(get_logger(),
-            "PIVOT: ang dropped below threshold (%.3f) — starting %dms exit hold",
-            ang, PIVOT_HOLD_MS_);
-        } else {
-          const auto exit_ms =
-            (now() - pivot_exit_start_).nanoseconds() / 1'000'000;
-          if (exit_ms >= PIVOT_HOLD_MS_) {
-            state_ = (std::fabs(ang) > ANG_SLOW_ZONE_)
-                       ? DriveState::SLOWING : DriveState::STRAIGHT;
-            pivot_exit_pending_ = false;
-            RCLCPP_INFO(get_logger(),
-              "PIVOT: ang stayed below threshold for %ldms — exiting PIVOT",
-              static_cast<long>(exit_ms));
-          }
-        }
-      }
-    } else if (state_ != DriveState::STOPPING) {
-      if (std::fabs(ang) > ANG_THRESHOLD_) {
-        // Entering PIVOT: ang must stay continuously ABOVE threshold, in the
-        // SAME direction, for PIVOT_HOLD_MS_ before we commit to a turn.
-        // Any tick that drops below threshold, or flips sign, resets the
-        // timer — until confirmed, output stays exactly as it already was
-        // (whatever STRAIGHT/SLOWING was already publishing).
-        const bool this_tick_left = (ang > 0.0);
+    // --- ARC vs STRAIGHT (hysteresis on |w|) ---
+    const double w_arc_thresh = (state_ == State::ARC) ? w_arc_exit_ : w_arc_enter_;
 
-        if (!pivot_entry_pending_ || this_tick_left != pivot_entry_was_left_) {
-          pivot_entry_pending_  = true;
-          pivot_entry_start_    = now();
-          pivot_entry_was_left_ = this_tick_left;
-          RCLCPP_INFO(get_logger(),
-            "ang crossed threshold (%.3f, dir=%s) — starting %dms entry hold",
-            ang, this_tick_left ? "LEFT" : "RIGHT", PIVOT_HOLD_MS_);
-        } else {
-          const auto entry_ms =
-            (now() - pivot_entry_start_).nanoseconds() / 1'000'000;
-          if (entry_ms >= PIVOT_HOLD_MS_) {
-            state_      = DriveState::STOPPING;
-            stop_start_ = now();
-            last_ang_   = ang;
-            pivot_entry_pending_ = false;
-            RCLCPP_INFO(get_logger(),
-              "ang held above threshold for %ldms — entering STOPPING phase (%dms)",
-              static_cast<long>(entry_ms), STOP_DURATION_MS_);
-          }
-          // else: still confirming, state_ unchanged, output stays as-is
-        }
-      } else {
-        pivot_entry_pending_ = false; // dipped below threshold, reset confirmation
-        if (std::fabs(ang) > ANG_SLOW_ZONE_) {
-          state_ = DriveState::SLOWING;
-        } else {
-          state_ = DriveState::STRAIGHT;
-        }
+    if (std::fabs(w) > w_arc_thresh) {
+      // ============ ARC: fixed PWM pair per direction + slew-limited steering ============
+      const bool fresh_arc = (state_ != State::ARC);
+      state_ = State::ARC;
+
+      // Nav2 w>0 = LEFT (CCW), w<0 = RIGHT (CW)
+      const bool   turn_left = (w > 0.0);
+      const double steer_pwm_cmd = turn_left ? arc_left_steer_pwm_  : arc_right_steer_pwm_;
+      const double thr_pwm_cmd   = turn_left ? arc_left_thr_pwm_    : arc_right_thr_pwm_;
+
+      // steering deviation from neutral that we want to reach
+      double steer_target = steer_pwm_cmd - neutral_;
+
+      // slew-rate limit so arc entry ramps smoothly instead of lurching
+      if (fresh_arc) { arc_steer_out_ = 0.0; arc_prev_set_ = false; }  // start ramp from neutral
+      if (arc_steer_slew_ > EPS) {
+        const double dt = arc_prev_set_
+          ? std::max(1e-3, (t - arc_prev_t_).seconds()) : (1.0 / std::max(1.0, rate_hz_));
+        const double max_step = arc_steer_slew_ * dt;
+        steer_target = clampd(steer_target, arc_steer_out_ - max_step, arc_steer_out_ + max_step);
       }
+      arc_steer_out_ = steer_target;
+      arc_prev_t_    = t;
+      arc_prev_set_  = true;
+
+      publish_pair(neutral_ + steer_target, thr_pwm_cmd);
+      log_throttled(v, w);
+      return;
+    }
+
+    // ============ STRAIGHT: throttle on + small steer + yaw-rate damper ============
+    state_ = State::DRIVE;
+    double thr_n = clampd(thr_sign_ * v / v_scale_, -1.0, 1.0);
+
+    // optional odom forward-speed governor
+    if (max_fwd_speed_ > EPS && have_odom_ && thr_n > 0.0
+        && fwd_speed_meas_ > max_fwd_speed_) {
+      thr_n *= clampd(max_fwd_speed_ / std::max(fwd_speed_meas_, 1e-3), 0.0, 1.0);
+    }
+
+    // yaw-rate damper: setpoint is ALWAYS Nav2's w (~0 here) -> holds heading straight
+    double eff_rate = w;
+    if (yaw_damp_enable_ && have_odom_) {
+      double fb = yaw_damp_kp_ * (w - yaw_rate_meas_);
+      fb = clampd(fb, -yaw_damp_max_, yaw_damp_max_);
+      eff_rate += fb;
+    }
+    double steer_n = clampd(steer_sign_ * eff_rate / w_scale_, -1.0, 1.0);
+
+    const double s = std::fabs(thr_n) + std::fabs(steer_n);
+    if (s > comfort_cap_ && s > EPS) {
+      const double k = comfort_cap_ / s; thr_n *= k; steer_n *= k;
+    }
+
+    // Throttle PWM: forward = FIXED drive_fwd_thr_pwm (default 1540);
+    // reverse keeps the original proportional mapping.
+    double thr_pwm;
+    if (thr_n > 0.0) {
+      double fwd_dev = drive_fwd_thr_pwm_ - neutral_;
+      // keep the speed governor effective on the fixed forward throttle
+      if (max_fwd_speed_ > EPS && have_odom_ && fwd_speed_meas_ > max_fwd_speed_) {
+        fwd_dev *= clampd(max_fwd_speed_ / std::max(fwd_speed_meas_, 1e-3), 0.0, 1.0);
+      }
+      thr_pwm = neutral_ + fwd_dev;
     } else {
-      last_ang_ = ang;
-      const auto elapsed_ms = (now() - stop_start_).nanoseconds() / 1'000'000;
-      if (elapsed_ms >= STOP_DURATION_MS_) {
-        state_ = DriveState::PIVOT;
-        RCLCPP_INFO(get_logger(), "-> STOPPING complete, entering PIVOT");
+      thr_pwm = neutral_ + thr_n * thr_span_;
+    }
+
+    publish_pair(neutral_ + steer_n * steer_span_, thr_pwm);
+    log_throttled(v, w);
+  }
+
+  // Window-integrated yaw-rate regulator for in-place rotation. Returns the
+  // steering PWM *deviation* (>=0; direction applied by caller).
+  double pivot_closed_loop_dev(double target_rate, const rclcpp::Time & t) {
+    if (!pivot_cl_)
+      return clampd(pivot_pwm_, pivot_min_dev_, pivot_max_dev_);
+
+    if (!pivot_win_set_) {
+      pivot_dev_       = pivot_pwm_;      // feedforward seed
+      pivot_win_start_ = t;
+      pivot_win_yaw_   = last_yaw_;
+      pivot_win_set_   = true;
+      return clampd(pivot_dev_, pivot_min_dev_, pivot_max_dev_);
+    }
+
+    const double odom_age = have_odom_
+      ? (t - last_odom_t_).seconds() : std::numeric_limits<double>::infinity();
+    if (odom_age > odom_timeout_s_) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
+        "PIVOT: odom stale (%.2fs) -> open-loop fallback (dev=%.0f)", odom_age, pivot_pwm_);
+      return clampd(pivot_pwm_, pivot_min_dev_, pivot_max_dev_);
+    }
+
+    const double win_dt = (t - pivot_win_start_).seconds();
+    if (win_dt >= pivot_window_s_) {
+      const double measured =
+        std::fabs(ang_diff(last_yaw_, pivot_win_yaw_)) / std::max(1e-3, win_dt);
+
+      if (measured > target_rate * over_rate_ratio_ && measured > over_rate_abs_) {
+        pivot_dev_ = std::max(pivot_dev_ - 2.0 * pivot_step_, pivot_min_dev_);
+      } else if (measured < pivot_stuck_rate_) {
+        pivot_dev_ = std::min(pivot_dev_ + pivot_breakaway_step_, pivot_max_dev_);
+      } else if (target_rate - measured > pivot_rate_tol_) {
+        pivot_dev_ = std::min(pivot_dev_ + pivot_step_, pivot_max_dev_);
+      } else if (measured - target_rate > pivot_rate_tol_) {
+        pivot_dev_ = std::max(pivot_dev_ - pivot_step_, pivot_min_dev_);
       }
-    }
 
-    if (prev_state == DriveState::PIVOT && state_ != DriveState::PIVOT) {
-      reset_pivot_state();
-    }
-    if (prev_state == DriveState::STRAIGHT && state_ != DriveState::STRAIGHT) {
-      reset_straight_state();
-    }
+      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 500,
+        "PIVOT loop: target=%.2f meas=%.2f rad/s -> dev=%.0f (PWM %.0f)  [effort=load]",
+        target_rate, measured, pivot_dev_, neutral_ + pivot_dev_);
 
-    // ── Output ────────────────────────────────────────────────────────────
+      pivot_win_start_ = t;
+      pivot_win_yaw_   = last_yaw_;
+    }
+    return clampd(pivot_dev_, pivot_min_dev_, pivot_max_dev_);
+  }
+
+  void log_throttled(double v, double w) {
+    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
+      "[%s] v=%+.2f w=%+.2f  yaw_rate=%+.2f spd=%.2f",
+      state_name(), v, w, yaw_rate_meas_, fwd_speed_meas_);
+  }
+  const char * state_name() const {
     switch (state_) {
-      case DriveState::STRAIGHT: {
-        if (lin > 0.0) {
-          if (!straight_check_set_) {
-            current_straight_output_ = THROTTLE_BASE_;
-            straight_check_start_    = now();
-            straight_start_x_        = odom_x_;
-            straight_start_y_        = odom_y_;
-            straight_check_set_      = true;
-          } else if (odom_ok_) {
-            const auto window_ms =
-              (now() - straight_check_start_).nanoseconds() / 1'000'000;
-            if (window_ms >= STRAIGHT_CHECK_MS_) {
-              const double dx   = odom_x_ - straight_start_x_;
-              const double dy   = odom_y_ - straight_start_y_;
-              const double dist = std::sqrt(dx * dx + dy * dy);
-
-              if (dist < STRAIGHT_DIST_THRESHOLD_) {
-                current_straight_output_ = std::min(
-                  current_straight_output_ + THROTTLE_STEP_, THROTTLE_MAX_);
-                RCLCPP_WARN(get_logger(),
-                  "STRAIGHT: insufficient progress (dist=%.3fm in %ldms), "
-                  "ramping throttle to %.0f",
-                  dist, static_cast<long>(window_ms), current_straight_output_);
-              } else {
-                RCLCPP_INFO(get_logger(),
-                  "STRAIGHT: progress OK (dist=%.3fm), throttle stays at %.0f",
-                  dist, current_straight_output_);
-              }
-              straight_check_start_ = now();
-              straight_start_x_     = odom_x_;
-              straight_start_y_     = odom_y_;
-            }
-          }
-          mc.channels[THROTTLE_CH_] = static_cast<uint16_t>(
-            std::clamp(current_straight_output_, THROTTLE_MIN_, THROTTLE_MAX_));
-        } else {
-          // No reverse, ever. Hold neutral and reset the ramp.
-          if (lin < 0.0) {
-            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-              "cmd_vel requested reverse (lin=%.3f) — reverse disabled, "
-              "holding neutral throttle.", lin);
-          }
-          reset_straight_state();
-          mc.channels[THROTTLE_CH_] = static_cast<uint16_t>(NEUTRAL_PWM_);
-        }
-        mc.channels[STEER_CH_] = static_cast<uint16_t>(NEUTRAL_PWM_);
-        break;
-      }
-
-      case DriveState::SLOWING:
-        mc.channels[THROTTLE_CH_] = static_cast<uint16_t>(
-          (lin > 0.0) ? SLOW_THROTTLE_ : NEUTRAL_PWM_);
-        mc.channels[STEER_CH_] = static_cast<uint16_t>(NEUTRAL_PWM_);
-        break;
-
-      case DriveState::STOPPING:
-        mc.channels[THROTTLE_CH_] = static_cast<uint16_t>(NEUTRAL_PWM_);
-        mc.channels[STEER_CH_]    = static_cast<uint16_t>(NEUTRAL_PWM_);
-        break;
-
-      case DriveState::PIVOT: {
-        mc.channels[THROTTLE_CH_] = static_cast<uint16_t>(NEUTRAL_PWM_);
-
-        // last_ang_ > 0 => LEFT (ASSUMPTION, verify on bench) => ramp toward PIVOT_MIN_
-        // last_ang_ <= 0 => RIGHT                              => ramp toward PIVOT_MAX_
-        const bool turning_left = (last_ang_ > 0.0);
-
-        if (!pivot_check_set_) {
-          current_pivot_output_ = turning_left ? PIVOT_LEFT_BASE_ : PIVOT_RIGHT_BASE_;
-          pivot_check_start_    = now();
-          pivot_start_yaw_      = odom_yaw_;
-          pivot_check_set_      = true;
-          RCLCPP_INFO(get_logger(), "PIVOT: direction=%s base_output=%.0f",
-            turning_left ? "LEFT" : "RIGHT", current_pivot_output_);
-        } else if (odom_ok_) {
-          const auto window_ms =
-            (now() - pivot_check_start_).nanoseconds() / 1'000'000;
-
-          if (window_ms >= PIVOT_CHECK_MS_) {
-            double yaw_delta = std::fabs(odom_yaw_ - pivot_start_yaw_);
-            if (yaw_delta > M_PI) yaw_delta = 2.0 * M_PI - yaw_delta;
-
-            if (yaw_delta < PIVOT_ROT_THRESHOLD_) {
-              if (turning_left) {
-                current_pivot_output_ = std::max(
-                  current_pivot_output_ - PIVOT_STEP_, PIVOT_MIN_);
-              } else {
-                current_pivot_output_ = std::min(
-                  current_pivot_output_ + PIVOT_STEP_, PIVOT_MAX_);
-              }
-              RCLCPP_WARN(get_logger(),
-                "PIVOT: insufficient rotation (yaw_delta=%.3f rad in %ldms), "
-                "ramping output to %.0f",
-                yaw_delta, static_cast<long>(window_ms), current_pivot_output_);
-            } else {
-              RCLCPP_INFO(get_logger(),
-                "PIVOT: rotating OK (yaw_delta=%.3f rad), output stays at %.0f",
-                yaw_delta, current_pivot_output_);
-            }
-
-            pivot_check_start_ = now();
-            pivot_start_yaw_   = odom_yaw_;
-          }
-        }
-
-        mc.channels[STEER_CH_] = static_cast<uint16_t>(
-          std::clamp(current_pivot_output_, PIVOT_MIN_, PIVOT_MAX_));
-        break;
-      }
-
-      case DriveState::STALLED:
-        break;
+      case State::IDLE:  return "IDLE";
+      case State::DRIVE: return "DRIVE";
+      case State::ARC:   return "ARC";
+      case State::STOP:  return "STOP";
+      case State::PIVOT: return "PIVOT";
+      case State::HOLD:  return "HOLD";
     }
-
-    RCLCPP_INFO(get_logger(),
-      "cmd_vel [lin=%.3f, ang=%.3f] -> state=%d [throttle=%d, steer=%d]",
-      msg->linear.x, msg->angular.z, static_cast<int>(state_),
-      mc.channels[THROTTLE_CH_], mc.channels[STEER_CH_]);
-
-    output_is_nonzero_ =
-      (mc.channels[THROTTLE_CH_] != static_cast<uint16_t>(NEUTRAL_PWM_) ||
-       mc.channels[STEER_CH_]    != static_cast<uint16_t>(NEUTRAL_PWM_));
-
-    // ── Stall detection (full stop — separate from throttle ramp above) ──
-    const bool in_moving_state =
-      (state_ == DriveState::STRAIGHT ||
-       state_ == DriveState::SLOWING  ||
-       state_ == DriveState::PIVOT);
-
-    if (in_moving_state && output_is_nonzero_ && odom_ok_) {
-      if (!stall_window_set_) {
-        stall_window_start_ = now();
-        stall_window_x_     = odom_x_;
-        stall_window_y_     = odom_y_;
-        stall_window_set_   = true;
-      } else {
-        const auto window_ms =
-          (now() - stall_window_start_).nanoseconds() / 1'000'000;
-
-        if (window_ms >= STALL_CHECK_MS_) {
-          const double dx   = odom_x_ - stall_window_x_;
-          const double dy   = odom_y_ - stall_window_y_;
-          const double dist = std::sqrt(dx * dx + dy * dy);
-
-          if (dist < STALL_DIST_THRESHOLD_) {
-            RCLCPP_WARN(get_logger(),
-              "STALL DETECTED: moved only %.4fm in %ldms while commanding motion. "
-              "Zeroing output for %dms.",
-              dist, static_cast<long>(window_ms), STALL_ZERO_MS_);
-            state_            = DriveState::STALLED;
-            stall_zero_start_ = now();
-            mc.channels[THROTTLE_CH_] = static_cast<uint16_t>(NEUTRAL_PWM_);
-            mc.channels[STEER_CH_]    = static_cast<uint16_t>(NEUTRAL_PWM_);
-            reset_stall_window();
-            reset_pivot_state();
-            reset_straight_state();
-          } else {
-            reset_stall_window();
-          }
-        }
-      }
-    } else {
-      reset_stall_window();
-    }
-
-    publish_override(mc, "drive");
+    return "?";
   }
 
-  double apply_deadzone(double v) const {
-    return (std::fabs(v) < DEADZONE_) ? 0.0 : v;
-  }
+  // ---------- members ----------
+  std::string input_topic_, output_topic_;
+  double rate_hz_{25.0}, watchdog_s_{0.3};
+  int steer_ch_{1}, thr_ch_{3}, arm_ch_{6};
+  int steer_idx_{0}, thr_idx_{2}, arm_idx_{5};
 
-  rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr    sub_;
-  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr      odom_sub_;
+  double neutral_{1501.0}, thr_span_{80.0}, steer_span_{80.0}, pivot_pwm_{100.0};
+  double comfort_cap_{1.0}, pwm_min_{1000.0}, pwm_max_{2000.0};
+  double v_scale_{0.5}, w_scale_{1.0}, thr_sign_{1.0}, steer_sign_{-1.0};
+
+  double drive_fwd_thr_pwm_{1540.0};
+
+  double w_arc_enter_{0.1}, w_arc_exit_{0.08};
+  double arc_right_thr_pwm_{1530.0}, arc_right_steer_pwm_{1550.0};
+  double arc_left_thr_pwm_{1570.0},  arc_left_steer_pwm_{1375.0};
+  double arc_steer_slew_{600.0};
+  bool   yaw_damp_enable_{true};
+  double yaw_damp_kp_{0.6}, yaw_damp_max_{0.4}, yaw_ema_alpha_{0.4};
+  double max_fwd_speed_{0.0}, spd_ema_alpha_{0.3};
+
+  bool   enable_pivot_{true};
+  double v_eps_{0.03}, w_eps_{0.05}, v_pivot_enter_{0.08}, v_pivot_exit_{0.15}, brake_time_s_{1.0};
+  double pivot_grace_s_{0.5};
+  bool   require_armed_{true};
+
+  bool   pivot_cl_{true};
+  std::string odom_topic_{"/odom"};
+  double pivot_window_s_{0.4}, pivot_min_dev_{60.0}, pivot_max_dev_{299.0};
+  double pivot_step_{20.0}, pivot_breakaway_step_{40.0};
+  double pivot_rate_tol_{0.05}, pivot_stuck_rate_{0.03}, odom_timeout_s_{0.3};
+  double over_rate_ratio_{1.5}, over_rate_abs_{0.2}, max_pivot_rate_{0.0};
+
+  std::mutex mtx_;
+  double last_v_{0.0}, last_w_{0.0};
+  rclcpp::Time last_cmd_t_;
+  bool have_cmd_{false};
+  bool is_armed_{false}, was_armed_{false};
+
+  State state_{State::IDLE};
+  rclcpp::Time stop_start_;
+  double pivot_dir_{0.0};
+
+  // pivot latch / skip-rebrake
+  rclcpp::Time last_pivot_cmd_t_, last_pivot_exit_t_;
+  double last_pivot_dir_{0.0}, last_exit_pivot_dir_{0.0}, last_pivot_target_{0.0};
+  bool   have_pivot_cmd_{false}, have_pivot_exit_{false};
+
+  // arc steer slew
+  double arc_steer_out_{0.0};
+  rclcpp::Time arc_prev_t_;
+  bool   arc_prev_set_{false};
+
+  // odom-derived
+  double last_yaw_{0.0}, prev_yaw_{0.0}, prev_px_{0.0}, prev_py_{0.0};
+  double yaw_rate_meas_{0.0}, fwd_speed_meas_{0.0};
+  rclcpp::Time last_odom_t_;
+  bool   have_odom_{false}, have_prev_odom_{false};
+
+  // pivot loop
+  double pivot_dev_{100.0};
+  rclcpp::Time pivot_win_start_;
+  double pivot_win_yaw_{0.0};
+  bool   pivot_win_set_{false};
+
+  rclcpp::Publisher<mavros_msgs::msg::OverrideRCIn>::SharedPtr pub_;
+  rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr   sub_;
   rclcpp::Subscription<mavros_msgs::msg::State>::SharedPtr      state_sub_;
-  rclcpp::Subscription<mavros_msgs::msg::RCIn>::SharedPtr       rc_in_sub_;
-  rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
-  rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr polygon_marker_pub_;
-
-  rclcpp::Publisher<mavros_msgs::msg::OverrideRCIn>::SharedPtr  pub_;
-  rclcpp::TimerBase::SharedPtr                                  control_timer_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr      odom_sub_;
+  rclcpp::TimerBase::SharedPtr timer_;
+  OnSetParametersCallbackHandle::SharedPtr param_cb_;
 };
 
-int main(int argc, char **argv) {
+int main(int argc, char ** argv) {
   rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<TrovBridgeDrive>());
+  rclcpp::spin(std::make_shared<CmdVelRcBridge>());
   rclcpp::shutdown();
   return 0;
 }
